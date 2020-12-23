@@ -91,6 +91,8 @@ type renderable struct {
 	vals chartutil.Values
 	// namespace prefix to the templates of the current chart
 	basePath string
+	// full path to the template file
+	fullPath string
 }
 
 const warnStartDelim = "HELM_ERR_START"
@@ -131,6 +133,11 @@ func (e Engine) initFunMap(t *template.Template, referenceTpls map[string]render
 			return "", errors.Wrapf(err, "cannot retrieve Template.Basepath from values inside tpl function: %s", tpl)
 		}
 
+		fullPath, err := vals.PathValue("Template.FullPath")
+		if err != nil {
+			return "", errors.Wrapf(err, "cannot retrieve Template.FullPath from values inside tpl function: %s", tpl)
+		}
+
 		templateName, err := vals.PathValue("Template.Name")
 		if err != nil {
 			return "", errors.Wrapf(err, "cannot retrieve Template.Name from values inside tpl function: %s", tpl)
@@ -141,6 +148,7 @@ func (e Engine) initFunMap(t *template.Template, referenceTpls map[string]render
 				tpl:      tpl,
 				vals:     vals,
 				basePath: basePath.(string),
+				fullPath: fullPath.(string),
 			},
 		}
 
@@ -214,47 +222,48 @@ func (e Engine) renderWithReferences(tpls, referenceTpls map[string]renderable) 
 	e.initFunMap(t, referenceTpls)
 
 	// We want to parse the templates in a predictable order. The order favors
-	// higher-level (in file system) templates over deeply nested templates.
+	// higher-level (with shorter keys) templates over deeply nested templates.
 	keys := sortTemplates(tpls)
 	referenceKeys := sortTemplates(referenceTpls)
 
-	for _, filename := range keys {
-		r := tpls[filename]
-		if _, err := t.New(filename).Parse(r.tpl); err != nil {
-			return map[string]string{}, cleanupParseError(filename, err)
+	for _, key := range keys {
+		tpl := tpls[key]
+		if _, err := t.New(tpl.fullPath).Parse(tpl.tpl); err != nil {
+			return map[string]string{}, cleanupParseError(tpl.fullPath, err)
 		}
 	}
 
 	// Adding the reference templates to the template context
 	// so they can be referenced in the tpl function
-	for _, filename := range referenceKeys {
-		if t.Lookup(filename) == nil {
-			r := referenceTpls[filename]
-			if _, err := t.New(filename).Parse(r.tpl); err != nil {
-				return map[string]string{}, cleanupParseError(filename, err)
+	for _, key := range referenceKeys {
+		if t.Lookup(key) == nil {
+			tpl := referenceTpls[key]
+			if _, err := t.New(tpl.fullPath).Parse(tpl.tpl); err != nil {
+				return map[string]string{}, cleanupParseError(tpl.fullPath, err)
 			}
 		}
 	}
 
 	rendered = make(map[string]string, len(keys))
-	for _, filename := range keys {
+	for _, key := range keys {
+		tpl := tpls[key]
 		// Don't render partials. We don't care out the direct output of partials.
 		// They are only included from other templates.
-		if strings.HasPrefix(path.Base(filename), "_") {
+		if strings.HasPrefix(path.Base(tpl.fullPath), "_") {
 			continue
 		}
 		// At render time, add information about the template that is being rendered.
-		vals := tpls[filename].vals
-		vals["Template"] = chartutil.Values{"Name": filename, "BasePath": tpls[filename].basePath}
+		vals := tpl.vals
+		vals["Template"] = chartutil.Values{"Name": key, "BasePath": tpl.basePath, "FullPath": tpl.fullPath}
 		var buf strings.Builder
-		if err := t.ExecuteTemplate(&buf, filename, vals); err != nil {
-			return map[string]string{}, cleanupExecError(filename, err)
+		if err := t.ExecuteTemplate(&buf, tpl.fullPath, vals); err != nil {
+			return map[string]string{}, cleanupExecError(key, err)
 		}
 
 		// Work around the issue where Go will emit "<no value>" even if Options(missing=zero)
 		// is set. Since missing=error will never get here, we do not need to handle
 		// the Strict case.
-		rendered[filename] = strings.ReplaceAll(buf.String(), "<no value>", "")
+		rendered[key] = strings.ReplaceAll(buf.String(), "<no value>", "")
 	}
 
 	return rendered, nil
@@ -322,11 +331,13 @@ func (p byPathLen) Less(i, j int) bool {
 }
 
 // allTemplates returns all templates for a chart and its dependencies.
+// Keys of the returned map are ids to reference each template uniquely. Since charts can be referenced multiple times
+// through aliasing, the file path to a template file is no unique key.
 //
 // As it goes, it also prepares the values in a scope-sensitive manner.
 func allTemplates(c *chart.Chart, vals chartutil.Values) map[string]renderable {
 	templates := make(map[string]renderable)
-	recAllTpls(c, templates, vals)
+	recAllTpls(c, templates, vals, []string{c.Name()})
 	return templates
 }
 
@@ -334,7 +345,7 @@ func allTemplates(c *chart.Chart, vals chartutil.Values) map[string]renderable {
 //
 // As it recurses, it also sets the values to be appropriate for the template
 // scope.
-func recAllTpls(c *chart.Chart, templates map[string]renderable, vals chartutil.Values) {
+func recAllTpls(c *chart.Chart, templates map[string]renderable, vals chartutil.Values, dependencyTreePath []string) {
 	next := map[string]interface{}{
 		"Chart":        c.Metadata,
 		"Files":        newFiles(c.Files),
@@ -352,18 +363,20 @@ func recAllTpls(c *chart.Chart, templates map[string]renderable, vals chartutil.
 	}
 
 	for _, child := range c.Dependencies() {
-		recAllTpls(child, templates, next)
+		recAllTpls(child, templates, next, append(dependencyTreePath, child.Name()))
 	}
 
-	newParentID := c.ChartFullPath()
+	chartPath := c.ChartFullPath()
 	for _, t := range c.Templates {
 		if !isTemplateValid(c, t.Name) {
 			continue
 		}
-		templates[path.Join(newParentID, t.Name)] = renderable{
+		// don't use the chart path as template key, it may be different than the chart part due to aliasing
+		templates[strings.Join(append(dependencyTreePath, t.Name), "/")] = renderable{
 			tpl:      string(t.Data),
 			vals:     next,
-			basePath: path.Join(newParentID, "templates"),
+			basePath: path.Join(chartPath, "templates"),
+			fullPath: path.Join(chartPath, t.Name),
 		}
 	}
 }

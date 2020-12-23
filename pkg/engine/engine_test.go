@@ -166,6 +166,80 @@ func TestRenderRefsOrdering(t *testing.T) {
 	}
 }
 
+func TestRenderAliasedSubCharts(t *testing.T) {
+	parentChart := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name:    "parent",
+			Version: "1.2.3",
+		},
+	}
+
+	templates := []*chart.File{
+		{Name: "templates/test.yaml", Data: []byte(`{{ toYaml .Values }}`)},
+	}
+
+	// use the identical grandchild for first and second child, which happens if first and second child are aliases
+	// of the same chart
+	sharedGrandChild := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name:    "grandchild",
+			Version: "1.2.3",
+		},
+		Templates: templates,
+	}
+
+	firstChild := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name:    "first-child",
+			Version: "1.2.3",
+		},
+		Templates: templates,
+	}
+	firstChild.AddDependency(sharedGrandChild)
+	parentChart.AddDependency(firstChild)
+
+	secondChild := &chart.Chart{
+		Metadata: &chart.Metadata{
+			Name:    "second-child",
+			Version: "1.2.3",
+		},
+		Templates: templates,
+	}
+	secondChild.AddDependency(sharedGrandChild)
+
+	parentChart.AddDependency(secondChild)
+
+	expect := map[string]string{
+		"parent/first-child/templates/test.yaml":             "grandchild:\n  from: first",
+		"parent/second-child/templates/test.yaml":            "grandchild:\n  from: second",
+		"parent/first-child/grandchild/templates/test.yaml":  "from: first",
+		"parent/second-child/grandchild/templates/test.yaml": "from: second",
+	}
+
+	vals := chartutil.Values{"Values": map[string]interface{}{
+		"first-child": map[string]interface{}{
+			"grandchild": map[string]interface{}{
+				"from": "first"}},
+		"second-child": map[string]interface{}{
+			"grandchild": map[string]interface{}{
+				"from": "second"}},
+	}}
+	out, err := Render(parentChart, vals)
+	if err != nil {
+		t.Fatalf("Failed to render templates: %s", err)
+	}
+
+	for name, data := range expect {
+		if out[name] != data {
+			t.Fatalf("Expected %q, got %q", data, out[name])
+		}
+		delete(out, name)
+	}
+	if len(out) > 0 {
+		t.Fatalf("More templates rendered than expected, unexpected output: %v", out)
+	}
+}
+
 func TestRenderInternals(t *testing.T) {
 	// Test the internals of the rendering tool.
 
@@ -426,17 +500,17 @@ func TestRenderNestedValues(t *testing.T) {
 		t.Errorf("Unexpected outer: %q", out[fullouterpath])
 	}
 
-	fullinnerpath := "top/charts/herrick/" + innerpath
+	fullinnerpath := "top/herrick/" + innerpath
 	if out[fullinnerpath] != "Old time is still a-flyin'" {
 		t.Errorf("Unexpected inner: %q", out[fullinnerpath])
 	}
 
-	fulldeepestpath := "top/charts/herrick/charts/deepest/" + deepestpath
+	fulldeepestpath := "top/herrick/deepest/" + deepestpath
 	if out[fulldeepestpath] != "And this same flower that smiles to-day" {
 		t.Errorf("Unexpected deepest: %q", out[fulldeepestpath])
 	}
 
-	fullcheckrelease := "top/charts/herrick/charts/deepest/" + checkrelease
+	fullcheckrelease := "top/herrick/deepest/" + checkrelease
 	if out[fullcheckrelease] != "Tomorrow will be dyin" {
 		t.Errorf("Unexpected release: %q", out[fullcheckrelease])
 	}
@@ -479,9 +553,9 @@ func TestRenderBuiltinValues(t *testing.T) {
 	}
 
 	expects := map[string]string{
-		"Troy/charts/Latium/templates/Lavinia": "Troy/charts/Latium/templates/LaviniaLatiumAeneid",
-		"Troy/templates/Aeneas":                "Troy/templates/AeneasTroyAeneid",
-		"Troy/charts/Latium/templates/From":    "Virgil Aeneid",
+		"Troy/Latium/templates/Lavinia": "Troy/Latium/templates/LaviniaLatiumAeneid",
+		"Troy/templates/Aeneas":         "Troy/templates/AeneasTroyAeneid",
+		"Troy/Latium/templates/From":    "Virgil Aeneid",
 	}
 	for file, expect := range expects {
 		if out[file] != expect {
